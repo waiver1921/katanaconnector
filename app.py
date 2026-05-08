@@ -154,30 +154,32 @@ def katana_patch(path: str, payload: dict) -> dict | None:
         return None
 
 
-def find_katana_so(shopify_order_id: str, max_wait: int = 120) -> dict | None:
+def find_katana_so(shopify_order_number: str, max_wait: int = 120) -> dict | None:
     """
     Polling: каждые 10 сек спрашиваем Katana пока не найдём SO.
-    Katana хранит Shopify order ID в поле ecommerce_order_id — ищем по нему.
+    Ищем по order_no — Katana коннектор пишет туда номер Shopify заказа
+    в формате "#1007". Пробуем оба варианта: "#1007" и "1007".
     Максимум 120 сек = 12 попыток.
     """
-    log.info(f"Polling Katana for SO with ecommerce_order_id={shopify_order_id} (max {max_wait}s)")
+    log.info(f"Polling Katana for SO order_no={shopify_order_number} (max {max_wait}s)")
 
     attempts = max_wait // 10
 
     for attempt in range(1, attempts + 1):
         time.sleep(10)
 
-        result = katana_get("/sales-orders", params={"ecommerce_order_id": shopify_order_id})
-        if result:
-            orders = result.get("data", result) if isinstance(result, dict) else result
-            if isinstance(orders, list) and len(orders) > 0:
-                so = orders[0]
-                log.info(f"Found SO id={so['id']} on attempt {attempt}")
-                return so
+        for search_term in [f"#{shopify_order_number}", shopify_order_number]:
+            result = katana_get("/sales_orders", params={"order_no": search_term})
+            if result:
+                orders = result.get("data", result) if isinstance(result, dict) else result
+                if isinstance(orders, list) and len(orders) > 0:
+                    so = orders[0]
+                    log.info(f"Found SO id={so['id']} on attempt {attempt}")
+                    return so
 
         log.info(f"SO not found yet, attempt {attempt}/{attempts}")
 
-    log.error(f"SO for Shopify order id={shopify_order_id} not found after {max_wait}s")
+    log.error(f"SO for order #{shopify_order_number} not found after {max_wait}s")
     return None
 
 
@@ -195,8 +197,8 @@ def process_order(order: dict):
 
     log.info(f"▶ Processing order #{order_number} (id={order_id})")
 
-    # 1. Ждём SO в Katana — ищем по Shopify order ID (ecommerce_order_id)
-    so = find_katana_so(order_id)
+    # 1. Ждём SO в Katana — ищем по order_no (номер заказа Shopify)
+    so = find_katana_so(order_number)
     if not so:
         send_alert(
             f"SO not found — order #{order_number}",
@@ -236,7 +238,7 @@ def process_order(order: dict):
         return
 
     log.info(f"Updating SO {so_id}: {payload}")
-    result = katana_patch(f"/sales-orders/{so_id}", payload)
+    result = katana_patch(f"/sales_orders/{so_id}", payload)
 
     if result:
         log.info(f"✓ SO {so_id} updated successfully")
