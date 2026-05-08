@@ -1,7 +1,7 @@
 # app.py — Код 1: Shopify webhook → Katana SO sync
 # Делает только три вещи:
 #   1. Принимает и верифицирует webhook от Shopify
-#   2. Ждёт пока Katana создаст SO (polling)
+#   2. Ждёт пока Katana создаст SO (polling по ecommerce_order_id)
 #   3. Обновляет delivery_date + additional_info (теги + notes)
 
 import os
@@ -70,13 +70,13 @@ def send_alert(subject: str, body: str):
 def parse_tags(raw_tags: str) -> tuple[str | None, list[str]]:
     """
     Формат даты в теге: DD-MM-YYYY (например "05-12-2026" = 5 декабря 2026).
-    Katana ожидает YYYY-MM-DD — конвертируем при парсинге.
+    Katana требует ISO 8601 с временем и таймзоной — конвертируем при парсинге.
 
     Тег с датой распознаётся по паттерну DD-MM-YYYY, других тегов
-    такого вида не бывает.
+    такого вида не бывает. Порядок тегов не важен.
 
-    Пример входа:  "05-12-2026, vip, fragile"
-    Результат:     delivery_date="2026-12-05", other_tags=["vip", "fragile"]
+    Пример входа:  "vip, 05-12-2026, fragile"
+    Результат:     delivery_date="2026-12-05T00:00:00+00:00", other_tags=["vip", "fragile"]
     """
     if not raw_tags:
         return None, []
@@ -93,7 +93,8 @@ def parse_tags(raw_tags: str) -> tuple[str | None, list[str]]:
             # Валидируем что это реальная дата (например 32-13-2026 упадёт здесь)
             try:
                 datetime.strptime(f"{day}-{month}-{year}", "%d-%m-%Y")
-                delivery_date = f"{year}-{month}-{day}"  # → YYYY-MM-DD для Katana
+                # Katana требует ISO 8601 с временем и таймзоной
+                delivery_date = f"{year}-{month}-{day}T00:00:00+00:00"
             except ValueError:
                 log.warning(f"Tag looks like a date but is invalid: '{tag}'")
                 other_tags.append(tag)  # не теряем тег, кладём в other_tags
@@ -153,37 +154,30 @@ def katana_patch(path: str, payload: dict) -> dict | None:
         return None
 
 
-def find_katana_so(shopify_order_number: str, max_wait: int = 120) -> dict | None:
+def find_katana_so(shopify_order_id: str, max_wait: int = 120) -> dict | None:
     """
     Polling: каждые 10 сек спрашиваем Katana пока не найдём SO.
-    Ищем по номеру заказа Shopify (Katana коннектор пишет его в order_no).
+    Katana хранит Shopify order ID в поле ecommerce_order_id — ищем по нему.
     Максимум 120 сек = 12 попыток.
     """
-    log.info(f"Polling Katana for SO #{shopify_order_number} (max {max_wait}s)")
+    log.info(f"Polling Katana for SO with ecommerce_order_id={shopify_order_id} (max {max_wait}s)")
 
     attempts = max_wait // 10
 
     for attempt in range(1, attempts + 1):
         time.sleep(10)
 
-        # Katana коннектор может писать номер как "1234" или "#1234"
-        for search_term in [shopify_order_number, f"#{shopify_order_number}"]:
-            result = katana_get("/sales-orders", params={"search": search_term})
-            if not result:
-                continue
-
+        result = katana_get("/sales-orders", params={"ecommerce_order_id": shopify_order_id})
+        if result:
             orders = result.get("data", result) if isinstance(result, dict) else result
-
-            for so in (orders if isinstance(orders, list) else []):
-                so_order_no = str(so.get("order_no",    "")).lstrip("#")
-                so_ext_id   = str(so.get("external_id", ""))
-                if so_order_no == shopify_order_number or so_ext_id == shopify_order_number:
-                    log.info(f"Found SO id={so['id']} on attempt {attempt}")
-                    return so
+            if isinstance(orders, list) and len(orders) > 0:
+                so = orders[0]
+                log.info(f"Found SO id={so['id']} on attempt {attempt}")
+                return so
 
         log.info(f"SO not found yet, attempt {attempt}/{attempts}")
 
-    log.error(f"SO for order #{shopify_order_number} not found after {max_wait}s")
+    log.error(f"SO for Shopify order id={shopify_order_id} not found after {max_wait}s")
     return None
 
 
@@ -201,8 +195,8 @@ def process_order(order: dict):
 
     log.info(f"▶ Processing order #{order_number} (id={order_id})")
 
-    # 1. Ждём SO в Katana
-    so = find_katana_so(order_number)
+    # 1. Ждём SO в Katana — ищем по Shopify order ID (ecommerce_order_id)
+    so = find_katana_so(order_id)
     if not so:
         send_alert(
             f"SO not found — order #{order_number}",
